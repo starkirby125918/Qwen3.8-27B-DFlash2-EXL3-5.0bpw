@@ -719,7 +719,10 @@ async def responses_completions(request):
         in_think = [True]
         THINK_CLOSE = "</think>"
         content_item_id = f"msg_{uuid.uuid4().hex[:12]}"
+        reasoning_item_id = f"rs_{uuid.uuid4().hex[:12]}"
         item_announced = [False]
+        reasoning_announced = [False]
+        reasoning_done = [False]
 
         async def emit(etype, payload):
             obj = {"type": etype}
@@ -733,16 +736,21 @@ async def responses_completions(request):
                 if in_think[0]:
                     close = pending.find(THINK_CLOSE)
                     if close >= 0:
-                        if pending[:close].strip() and not item_announced[0]:
-                            item_announced[0] = True
+                        if pending[:close].strip() and not reasoning_announced[0]:
+                            reasoning_announced[0] = True
                             await emit("response.output_item.added", {
-                                "item": {"type": "message", "id": content_item_id,
-                                         "status": "in_progress", "role": "assistant",
-                                         "content": []}, "output_index": 0})
+                                "item": {"type": "reasoning", "id": reasoning_item_id,
+                                         "status": "in_progress",
+                                         "summary": []}, "output_index": 0})
                         if pending[:close].strip():
-                            await emit("response.output_text.delta", {
-                                "item_id": content_item_id, "output_index": 0,
-                                "content_index": 0, "delta": pending[:close].strip()})
+                            await emit("response.reasoning_text.delta", {
+                                "item_id": reasoning_item_id, "output_index": 0,
+                                "delta": pending[:close].strip()})
+                        if reasoning_announced[0]:
+                            reasoning_done[0] = True
+                            await emit("response.reasoning_text.done", {
+                                "item_id": reasoning_item_id, "output_index": 0,
+                                "text": ""})
                         pending = pending[close + len(THINK_CLOSE):]
                         in_think[0] = False
                         continue
@@ -750,15 +758,15 @@ async def responses_completions(request):
                     piece = pending[:cut]
                     pending = pending[cut:]
                     if piece.strip():
-                        if not item_announced[0]:
-                            item_announced[0] = True
+                        if not reasoning_announced[0]:
+                            reasoning_announced[0] = True
                             await emit("response.output_item.added", {
-                                "item": {"type": "message", "id": content_item_id,
-                                         "status": "in_progress", "role": "assistant",
-                                         "content": []}, "output_index": 0})
-                        await emit("response.output_text.delta", {
-                            "item_id": content_item_id, "output_index": 0,
-                            "content_index": 0, "delta": piece.strip()})
+                                "item": {"type": "reasoning", "id": reasoning_item_id,
+                                         "status": "in_progress",
+                                         "summary": []}, "output_index": 0})
+                        await emit("response.reasoning_text.delta", {
+                            "item_id": reasoning_item_id, "output_index": 0,
+                            "delta": piece.strip()})
                     if final or len(pending) <= HOLD_BACK:
                         return
                 else:
@@ -839,9 +847,15 @@ async def responses_completions(request):
                 await flush(final = True)
                 if forced_choice:
                     if reasoning:
-                        await emit("response.output_text.delta", {
-                            "item_id": content_item_id, "output_index": 0,
-                            "content_index": 0, "delta": reasoning})
+                        if not reasoning_announced[0]:
+                            reasoning_announced[0] = True
+                            await emit("response.output_item.added", {
+                                "item": {"type": "reasoning", "id": reasoning_item_id,
+                                         "status": "in_progress",
+                                         "summary": []}, "output_index": 0})
+                        await emit("response.reasoning_text.delta", {
+                            "item_id": reasoning_item_id, "output_index": 0,
+                            "delta": reasoning})
                     if content:
                         if not item_announced[0]:
                             item_announced[0] = True
@@ -852,6 +866,15 @@ async def responses_completions(request):
                         await emit("response.output_text.delta", {
                             "item_id": content_item_id, "output_index": 0,
                             "content_index": 0, "delta": content})
+                if reasoning_announced[0] and not reasoning_done[0]:
+                    reasoning_done[0] = True
+                    await emit("response.reasoning_text.done", {
+                        "item_id": reasoning_item_id, "output_index": 0,
+                        "text": ""})
+                if item_announced[0]:
+                    await emit("response.output_text.done", {
+                        "item_id": content_item_id, "output_index": 0,
+                        "content_index": 0, "text": content or ""})
                 if not calls and item_announced[0]:
                     await emit("response.output_item.done", {
                         "item": {"type": "message", "id": content_item_id,
