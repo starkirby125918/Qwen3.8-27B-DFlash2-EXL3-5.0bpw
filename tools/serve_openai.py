@@ -37,6 +37,15 @@ Launch (from repo root):
 import argparse, json, os, re, sys, time, threading, uuid
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aiohttp import web
+# OpenAI Responses API adapter (responses -> chat conversion)
+try:
+    from tools.responses_converter import responses_to_chat
+except ImportError:
+    # running from the engine repo layout
+    try:
+        from responses_converter import responses_to_chat
+    except ImportError:
+        responses_to_chat = None
 
 MODEL_DIR = "test_models/Qwen3.8-27B-exl3-3.5bpw-wm"
 DRAFT_DIR = "mtp"   # default drafting method: MTP head (no external draft model)
@@ -117,6 +126,9 @@ def normalize_messages(messages):
     out = []
     for m in messages:
         m = dict(m)
+        # OpenAI developer role -> system for Qwen templates
+        if m.get("role") == "developer":
+            m["role"] = "system"
         if m.get("role") == "assistant" and m.get("tool_calls"):
             calls = []
             for c in m["tool_calls"]:
@@ -400,6 +412,7 @@ def parse_request(body):
         tool_choice = body.get("tool_choice"),
         stop = stop,
         stream = bool(body.get("stream", False)),
+        include_usage = bool((body.get("stream_options") or {}).get("include_usage", False)),
         model_id = body.get("model", "qwen3.8-27b-exl3-3.5bpw-wm"),
     ), None
 
@@ -475,7 +488,7 @@ async def chat_completions(request):
                     req["seed"], req["tools"], req["tool_choice"], req["stop"],
                     on_text = None if forced_choice else on_text)
                 loop.call_soon_threadsafe(queue.put_nowait,
-                                          ("done", (calls, finish, reasoning, content)))
+                                          ("done", (calls, finish, reasoning, content, ptoks, otoks)))
             except Exception as e:
                 loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
         loop.run_in_executor(None, worker)
@@ -553,7 +566,7 @@ async def chat_completions(request):
                 pending += payload
                 await flush_pending()
             elif kind == "done":
-                calls, finish, reasoning, content = payload
+                calls, finish, reasoning, content, ptoks, otoks = payload
                 await flush_pending(final = True)
                 if forced_choice:
                     # Buffered path (no deltas were streamed): emit the
@@ -566,6 +579,289 @@ async def chat_completions(request):
                     for c in calls:
                         await send_call(c)
                 await send({}, finish = finish)
+                if req["include_usage"]:
+                    # OpenAI spec: final usage chunk carries empty choices
+                    usage_obj = {"id": cid, "object": "chat.completion.chunk",
+                                 "created": int(time.time()), "model": model_id,
+                                 "choices": [],
+                                 "usage": {"prompt_tokens": ptoks,
+                                           "completion_tokens": otoks,
+                                           "total_tokens": ptoks + otoks}}
+                    await resp.write(f"data: {json.dumps(usage_obj)}\n\n".encode())
+                await resp.write(b"data: [DONE]\n\n")
+                break
+        await resp.write_eof()
+    try:
+        await run()
+    except ConnectionResetError:
+        pass
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Responses API adapter
+# ---------------------------------------------------------------------------
+
+def _responses_item_chunk(rid, item, rid_index):
+    """A response.output_item.added chunk item. item: {type, id, ...}."""
+    return {"type": "response.output_item.added",
+            "item": item, "output_index": rid_index}
+
+
+def _responses_completed(cid, text, calls, ptoks, otoks, status="completed"):
+    """Assemble the final response.completed event object."""
+    output = []
+    if calls:
+        for c in calls:
+            output.append({"type": "function_call",
+                           "id": c["id"],
+                           "call_id": c["id"],
+                           "name": c["function"]["name"],
+                           "arguments": c["function"]["arguments"],
+                           "status": "completed"})
+    elif text:
+        output.append({"type": "message", "id": f"msg_{uuid.uuid4().hex[:12]}",
+                       "status": "completed",
+                       "role": "assistant",
+                       "content": [{"type": "output_text", "text": text,
+                                    "annotations": []}]})
+    return {"type": "response.completed", "response": {
+        "id": cid, "object": "response", "created_at": int(time.time()),
+        "status": status, "output": output,
+        "usage": {"input_tokens": ptoks, "output_tokens": otoks,
+                  "total_tokens": ptoks + otoks}}}
+
+
+async def responses_completions(request):
+    """POST /v1/responses — OpenAI Responses API adapter (text only).
+
+    Builds a chat request from the responses payload, runs the model, then
+    returns either a single response object or an SSE event stream carrying
+    response.* events.
+    """
+    if responses_to_chat is None:
+        return web.json_response({"error": {"message": "responses adapter unavailable"}},
+                                 status = 500)
+    app = request.app
+    generator, tokenizer = app["generator"], app["tokenizer"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": {"message": "invalid JSON"}}, status = 400)
+
+    chat_body, err = responses_to_chat(body)
+    if err:
+        return web.json_response({"error": {"message": err,
+                                            "type": "invalid_request_error"}},
+                                 status = 400)
+    # reuse parse_request (tolerates extra keys it ignores)
+    req, err2 = parse_request(chat_body)
+    if err2:
+        return web.json_response({"error": {"message": err2,
+                                            "type": "invalid_request_error"}},
+                                 status = 400)
+
+    import asyncio
+    cid = f"resp_{uuid.uuid4().hex[:12]}"
+    stream = bool(chat_body.get("stream", False))
+
+    if not stream:
+        try:
+            text, calls, finish, ptoks, otoks, reasoning, content = await asyncio.to_thread(
+                generate_full, generator, tokenizer, req["messages"],
+                req["max_tokens"], req["temperature"], req["top_p"], req["top_k"],
+                req["seed"], req["tools"], req["tool_choice"], req["stop"])
+        except AssertionError as e:
+            return web.json_response(
+                {"error": {"message": f"context/cache: {e}",
+                           "type": "invalid_request_error"}}, status = 400)
+        obj = _responses_completed(cid, content, calls, ptoks, otoks)
+        obj["response"]["type"] = "response"
+        return web.json_response(obj)
+
+    # ---- streaming (SSE) ----
+    resp = web.StreamResponse(headers = {
+        "Content-Type": "text/event-stream", "Cache-Control": "no-cache",
+        "Connection": "keep-alive"})
+    await resp.prepare(request)
+    model_id = req["model_id"]
+    req_schemas = build_tool_schemas(req["tools"])
+
+    # initial response.created
+    await resp.write(f"data: {json.dumps({'type': 'response.created', 'response': {
+        'id': cid, 'object': 'response', 'created_at': int(time.time()),
+        'status': 'in_progress', 'model': model_id, 'output': []}})}\n\n".encode())
+
+    async def run():
+        loop = asyncio.get_event_loop()
+        queue = asyncio.Queue()
+
+        def on_text(chunk):
+            loop.call_soon_threadsafe(queue.put_nowait, ("delta", chunk))
+
+        forced_choice = req["tool_choice"] not in (None, "auto", "none")
+
+        def worker():
+            try:
+                text, calls, finish, ptoks, otoks, reasoning, content = generate_full(
+                    generator, tokenizer, req["messages"], req["max_tokens"],
+                    req["temperature"], req["top_p"], req["top_k"],
+                    req["seed"], req["tools"], req["tool_choice"], req["stop"],
+                    on_text = None if forced_choice else on_text)
+                loop.call_soon_threadsafe(queue.put_nowait,
+                                          ("done", (calls, finish, reasoning,
+                                                    content, ptoks, otoks)))
+            except Exception as e:
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", str(e)))
+        loop.run_in_executor(None, worker)
+
+        pending = ""
+        in_think = [True]
+        THINK_CLOSE = "</think>"
+        content_item_id = f"msg_{uuid.uuid4().hex[:12]}"
+        item_announced = [False]
+
+        async def emit(etype, payload):
+            obj = {"type": etype}
+            obj.update(payload)
+            await resp.write(f"data: {json.dumps(obj)}\n\n".encode())
+
+        async def flush(final = False):
+            nonlocal pending
+            while True:
+                piece = ""
+                if in_think[0]:
+                    close = pending.find(THINK_CLOSE)
+                    if close >= 0:
+                        if pending[:close].strip() and not item_announced[0]:
+                            item_announced[0] = True
+                            await emit("response.output_item.added", {
+                                "item": {"type": "message", "id": content_item_id,
+                                         "status": "in_progress", "role": "assistant",
+                                         "content": []}, "output_index": 0})
+                        if pending[:close].strip():
+                            await emit("response.output_text.delta", {
+                                "item_id": content_item_id, "output_index": 0,
+                                "content_index": 0, "delta": pending[:close].strip()})
+                        pending = pending[close + len(THINK_CLOSE):]
+                        in_think[0] = False
+                        continue
+                    cut = len(pending) if final else max(0, len(pending) - HOLD_BACK)
+                    piece = pending[:cut]
+                    pending = pending[cut:]
+                    if piece.strip():
+                        if not item_announced[0]:
+                            item_announced[0] = True
+                            await emit("response.output_item.added", {
+                                "item": {"type": "message", "id": content_item_id,
+                                         "status": "in_progress", "role": "assistant",
+                                         "content": []}, "output_index": 0})
+                        await emit("response.output_text.delta", {
+                            "item_id": content_item_id, "output_index": 0,
+                            "content_index": 0, "delta": piece.strip()})
+                    if final or len(pending) <= HOLD_BACK:
+                        return
+                else:
+                    if TOOL_CALL_OPEN in pending:
+                        head, rest = pending.split(TOOL_CALL_OPEN, 1)
+                        if head.strip():
+                            if not item_announced[0]:
+                                item_announced[0] = True
+                                await emit("response.output_item.added", {
+                                    "item": {"type": "message", "id": content_item_id,
+                                             "status": "in_progress", "role": "assistant",
+                                             "content": []}, "output_index": 0})
+                            await emit("response.output_text.delta", {
+                                "item_id": content_item_id, "output_index": 0,
+                                "content_index": 0, "delta": head.strip()})
+                        if TOOL_CALL_CLOSE in rest:
+                            block, pending = rest.split(TOOL_CALL_CLOSE, 1)
+                            _, calls = parse_tool_calls(
+                                TOOL_CALL_OPEN + block + TOOL_CALL_CLOSE, req_schemas)
+                            for idx, c in enumerate(calls):
+                                await emit("response.output_item.added", {
+                                    "item": {"type": "function_call", "id": c["id"],
+                                             "call_id": c["id"], "name": c["function"]["name"],
+                                             "arguments": c["function"]["arguments"],
+                                             "status": "in_progress"},
+                                    "output_index": idx})
+                                await emit("response.function_call_arguments.delta", {
+                                    "item_id": c["id"], "output_index": idx,
+                                    "delta": c["function"]["arguments"]})
+                                await emit("response.function_call_arguments.done", {
+                                    "item_id": c["id"], "output_index": idx,
+                                    "arguments": c["function"]["arguments"]})
+                            continue
+                        if final and "<function=" in rest:
+                            _, calls = parse_tool_calls(TOOL_CALL_OPEN + rest, req_schemas)
+                            for idx, c in enumerate(calls):
+                                await emit("response.output_item.added", {
+                                    "item": {"type": "function_call", "id": c["id"],
+                                             "call_id": c["id"], "name": c["function"]["name"],
+                                             "arguments": c["function"]["arguments"],
+                                             "status": "in_progress"},
+                                    "output_index": idx})
+                                await emit("response.function_call_arguments.done", {
+                                    "item_id": c["id"], "output_index": idx,
+                                    "arguments": c["function"]["arguments"]})
+                            pending = ""
+                        else:
+                            pending = TOOL_CALL_OPEN + rest
+                        return
+                    cut = len(pending) if final else max(0, len(pending) - HOLD_BACK)
+                    piece = pending[:cut]
+                    pending = pending[cut:]
+                    if piece.strip():
+                        if not item_announced[0]:
+                            item_announced[0] = True
+                            await emit("response.output_item.added", {
+                                "item": {"type": "message", "id": content_item_id,
+                                         "status": "in_progress", "role": "assistant",
+                                         "content": []}, "output_index": 0})
+                        await emit("response.output_text.delta", {
+                            "item_id": content_item_id, "output_index": 0,
+                            "content_index": 0, "delta": piece.strip()})
+                    if final or len(pending) <= HOLD_BACK:
+                        return
+
+        while True:
+            kind, payload = await queue.get()
+            if kind == "error":
+                await resp.write(f"data: {json.dumps({'type': 'response.failed', 'response': {
+                    'id': cid, 'object': 'response', 'status': 'failed'}})}\n\n".encode())
+                await resp.write(b"data: [DONE]\n\n")
+                break
+            if kind == "delta":
+                pending += payload
+                await flush()
+            elif kind == "done":
+                calls, finish, reasoning, content, ptoks, otoks = payload
+                await flush(final = True)
+                if forced_choice:
+                    if reasoning:
+                        await emit("response.output_text.delta", {
+                            "item_id": content_item_id, "output_index": 0,
+                            "content_index": 0, "delta": reasoning})
+                    if content:
+                        if not item_announced[0]:
+                            item_announced[0] = True
+                            await emit("response.output_item.added", {
+                                "item": {"type": "message", "id": content_item_id,
+                                         "status": "in_progress", "role": "assistant",
+                                         "content": []}, "output_index": 0})
+                        await emit("response.output_text.delta", {
+                            "item_id": content_item_id, "output_index": 0,
+                            "content_index": 0, "delta": content})
+                if not calls and item_announced[0]:
+                    await emit("response.output_item.done", {
+                        "item": {"type": "message", "id": content_item_id,
+                                 "status": "completed", "role": "assistant",
+                                 "content": [{"type": "output_text", "text": content,
+                                              "annotations": []}]},
+                        "output_index": 0})
+                # final completed event
+                obj = _responses_completed(cid, content, calls, ptoks, otoks)
+                await resp.write(f"data: {json.dumps(obj)}\n\n".encode())
                 await resp.write(b"data: [DONE]\n\n")
                 break
         await resp.write_eof()
@@ -630,6 +926,7 @@ def main():
     app.router.add_get("/v1/models", models)
     app.router.add_get("/health", health)
     app.router.add_post("/v1/chat/completions", chat_completions)
+    app.router.add_post("/v1/responses", responses_completions)
     web.run_app(app, host = args.host, port = args.port, print = None)
 
 
